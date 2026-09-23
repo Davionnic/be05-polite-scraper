@@ -552,8 +552,46 @@ def stage5():
     
     return valid_books, validation_errors, report
 
+def run_full_scraper():
+    """Run the complete scraper pipeline - the main entry point for users."""
+    print("FlyRank BE-05: The Polite Scraper")
+    print("=" * 50)
+    
+    scraper = PoliteScraper()
+    
+    # Run the complete pipeline
+    print("Starting complete scraping pipeline...")
+    
+    # Scrape all book details WITH error handling
+    raw_books_data = scraper.scrape_all_books(max_catalogue_pages=3, include_fake_url=True)
+    
+    # Validate and save
+    valid_books, validation_errors = scraper.validate_and_save_books(raw_books_data)
+    
+    # Generate comprehensive run report
+    catalogue_pages, _ = scraper.discover_catalogue_pages(max_pages=3)
+    report = scraper.generate_run_report(
+        catalogue_pages=catalogue_pages,
+        books_discovered=len(raw_books_data) + 1,  # +1 for fake URL
+        valid_books=len(valid_books),
+        validation_errors=len(validation_errors)
+    )
+    
+    # Print summary
+    print(f"\n🎉 Scraping Complete!")
+    print(f"📚 Books processed: {len(valid_books)}")
+    print(f"⏱️  Runtime: {report.total_runtime_seconds:.2f} seconds")
+    print(f"💾 Cache hits: {scraper.stats['cache_hits']}")
+    print(f"🌐 Network requests: {scraper.stats['network_requests']}")
+    print(f"📁 Output files:")
+    print(f"   - output/books.json ({len(valid_books)} books)")
+    print(f"   - output/run-report.json (run statistics)")
+    
+    if scraper.stats['failed_pages'] > 0:
+        print(f"⚠️  Failed pages: {scraper.stats['failed_pages']} (includes test failure)")
+
 def main():
-    """Main entry point - runs the appropriate stage."""
+    """Main entry point - runs the appropriate stage or full scraper."""
     import sys
     
     if len(sys.argv) > 1 and sys.argv[1] == "stage1":
@@ -567,8 +605,8 @@ def main():
     elif len(sys.argv) > 1 and sys.argv[1] == "stage5":
         stage5()
     else:
-        # Default: run stage 5 for now
-        stage5()
+        # Default: run the full scraper for end users
+        run_full_scraper()
 
 if __name__ == "__main__":
     main()
