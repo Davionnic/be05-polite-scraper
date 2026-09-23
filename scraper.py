@@ -17,6 +17,7 @@ import json
 import re
 from pydantic import BaseModel, field_validator, HttpUrl
 from decimal import Decimal
+import traceback
 
 # Configuration
 USER_AGENT = "FlyRankBE05Bot/1.0 (Davionnic; educational)"
@@ -64,6 +65,22 @@ class ValidationError(BaseModel):
     error_message: str
     field_errors: Dict[str, str] = {}
 
+class RunReport(BaseModel):
+    """Schema for run report."""
+    start_time: str
+    end_time: str
+    total_runtime_seconds: float
+    catalogue_pages_discovered: int
+    books_discovered: int
+    books_successfully_processed: int
+    validation_errors: int
+    failed_pages: int
+    cache_hits: int
+    network_requests: int
+    retry_attempts: int
+    error_summary: Dict[str, int] = {}
+    sample_book_url: str = ""
+
 class PoliteScraper:
     """A polite web scraper with caching and rate limiting."""
     
@@ -75,6 +92,17 @@ class PoliteScraper:
         self.output_dir = Path("output")
         self.cache_dir.mkdir(exist_ok=True)
         self.output_dir.mkdir(exist_ok=True)
+        
+        # Statistics for run reporting
+        self.stats = {
+            'cache_hits': 0,
+            'network_requests': 0,
+            'retry_attempts': 0,
+            'failed_pages': 0,
+            'error_summary': {},
+            'start_time': None,
+            'end_time': None
+        }
     
     def _wait_politely(self):
         """Ensure minimum delay between requests."""
@@ -97,10 +125,10 @@ class PoliteScraper:
             filename = f"{clean_path}-{path_hash}.html"
         return self.cache_dir / filename
     
-    def fetch_page(self, url: str, force_fetch: bool = False) -> tuple[str, bool]:
+    def fetch_page(self, url: str, force_fetch: bool = False, max_retries: int = 1) -> tuple[str, bool, bool]:
         """
-        Fetch a page with caching support.
-        Returns: (html_content, was_cache_hit)
+        Fetch a page with caching support and retry logic.
+        Returns: (html_content, was_cache_hit, fetch_failed)
         """
         cache_path = self._get_cache_path(url)
         
@@ -109,29 +137,53 @@ class PoliteScraper:
             html = cache_path.read_text(encoding='utf-8')
             size = len(html)
             print(f"CACHE HIT: {url} ({size:,} bytes)")
-            return html, True
+            self.stats['cache_hits'] += 1
+            return html, True, False
         
-        # Fetch from web
-        self._wait_politely()
+        # Try to fetch from web with retry logic
+        for attempt in range(max_retries + 1):
+            self._wait_politely()
+            
+            try:
+                response = self.session.get(url, timeout=REQUEST_TIMEOUT)
+                response.raise_for_status()
+                
+                html = response.text
+                size = len(html)
+                
+                # Cache the result
+                cache_path.write_text(html, encoding='utf-8')
+                
+                print(f"FETCH: {url} ({size:,} bytes)")
+                self.last_request_time = time.time()
+                self.stats['network_requests'] += 1
+                
+                return html, False, False
+                
+            except requests.RequestException as e:
+                if attempt < max_retries:
+                    # Retry for timeout/5xx errors only
+                    if (isinstance(e, requests.Timeout) or 
+                        (hasattr(e, 'response') and e.response is not None and e.response.status_code >= 500)):
+                        print(f"Retrying {url} (attempt {attempt + 1}/{max_retries + 1}): {e}")
+                        self.stats['retry_attempts'] += 1
+                        time.sleep(1)  # Brief delay before retry
+                        continue
+                
+                # Don't retry for 404/403 or final failure
+                print(f"ERROR fetching {url}: {e}")
+                self.stats['failed_pages'] += 1
+                
+                # Track error types
+                error_type = type(e).__name__
+                if hasattr(e, 'response') and e.response is not None:
+                    error_type = f"{error_type}_{e.response.status_code}"
+                self.stats['error_summary'][error_type] = self.stats['error_summary'].get(error_type, 0) + 1
+                
+                return "", False, True
         
-        try:
-            response = self.session.get(url, timeout=REQUEST_TIMEOUT)
-            response.raise_for_status()
-            
-            html = response.text
-            size = len(html)
-            
-            # Cache the result
-            cache_path.write_text(html, encoding='utf-8')
-            
-            print(f"FETCH: {url} ({size:,} bytes)")
-            self.last_request_time = time.time()
-            
-            return html, False
-            
-        except requests.RequestException as e:
-            print(f"ERROR fetching {url}: {e}")
-            raise
+        # Should never reach here
+        return "", False, True
     
     def extract_book_urls(self, html: str, source_page_url: str) -> List[str]:
         """Extract all book detail page URLs from a catalogue page."""
@@ -178,7 +230,12 @@ class PoliteScraper:
             print(f"\nProcessing catalogue page {page_num}: {current_url}")
             
             # Fetch the catalogue page
-            html, was_cached = self.fetch_page(current_url)
+            html, was_cached, fetch_failed = self.fetch_page(current_url)
+            
+            if fetch_failed:
+                print(f"Failed to fetch catalogue page {page_num}, skipping")
+                continue
+                
             catalogue_pages.append(current_url)
             
             # Extract book URLs from this page
@@ -202,9 +259,14 @@ class PoliteScraper:
         
         return catalogue_pages, all_book_urls
     
-    def extract_book_details(self, book_url: str, source_page: str) -> Dict[str, Any]:
+    def extract_book_details(self, book_url: str, source_page: str) -> Optional[Dict[str, Any]]:
         """Extract detailed information from a book page."""
-        html, was_cached = self.fetch_page(book_url)
+        html, was_cached, fetch_failed = self.fetch_page(book_url)
+        
+        if fetch_failed:
+            print(f"Failed to fetch book page: {book_url}")
+            return None
+            
         soup = BeautifulSoup(html, 'html.parser')
         
         # Extract title (from h1 in product_main)
@@ -252,10 +314,18 @@ class PoliteScraper:
             'fetched_at': fetched_at
         }
     
-    def scrape_all_books(self, max_catalogue_pages: int = 3) -> List[Dict[str, Any]]:
+    def scrape_all_books(self, max_catalogue_pages: int = 3, include_fake_url: bool = False) -> List[Dict[str, Any]]:
         """Scrape details for all books from the specified number of catalogue pages."""
+        self.stats['start_time'] = datetime.now().isoformat()
+        
         # First, discover all catalogue pages and book URLs
         catalogue_pages, book_urls = self.discover_catalogue_pages(max_pages=max_catalogue_pages)
+        
+        # Add a deliberate fake URL for Stage 5 requirements
+        if include_fake_url:
+            fake_url = "https://books.toscrape.com/catalogue/fake-book-that-does-not-exist_0000/index.html"
+            book_urls.append(fake_url)
+            print(f"\nAdded deliberate fake URL for error testing: {fake_url}")
         
         print(f"\nStarting book detail extraction for {len(book_urls)} books...")
         
@@ -273,17 +343,22 @@ class PoliteScraper:
             
             try:
                 book_data = self.extract_book_details(book_url, source_page)
-                books_data.append(book_data)
-                
-                # Print first record as required
-                if i == 1:
-                    print(f"\nFirst raw record:")
-                    print(json.dumps(book_data, indent=2))
+                if book_data is not None:  # Only add successful extractions
+                    books_data.append(book_data)
+                    
+                    # Print first record as required
+                    if len(books_data) == 1:
+                        print(f"\nFirst raw record:")
+                        print(json.dumps(book_data, indent=2))
                 
             except Exception as e:
                 print(f"ERROR processing book {book_url}: {e}")
+                self.stats['failed_pages'] += 1
+                error_type = type(e).__name__
+                self.stats['error_summary'][error_type] = self.stats['error_summary'].get(error_type, 0) + 1
                 continue
         
+        self.stats['end_time'] = datetime.now().isoformat()
         print(f"\nDetail pages fetched: detail_pages={len(books_data)}")
         return books_data
     
@@ -341,6 +416,48 @@ class PoliteScraper:
             print(f"Saved {len(validation_errors)} validation errors to {errors_file}")
         
         return valid_books, validation_errors
+    
+    def generate_run_report(self, catalogue_pages: List[str], books_discovered: int, 
+                          valid_books: int, validation_errors: int) -> RunReport:
+        """Generate a comprehensive run report."""
+        start_time = datetime.fromisoformat(self.stats['start_time'])
+        end_time = datetime.fromisoformat(self.stats['end_time'])
+        runtime = (end_time - start_time).total_seconds()
+        
+        # Get sample book URL (first valid book if any exist)
+        sample_url = ""
+        if os.path.exists(self.output_dir / "books.json"):
+            try:
+                with open(self.output_dir / "books.json", 'r') as f:
+                    books = json.load(f)
+                    if books:
+                        sample_url = books[0]['product_url']
+            except Exception:
+                pass
+        
+        report = RunReport(
+            start_time=self.stats['start_time'],
+            end_time=self.stats['end_time'],
+            total_runtime_seconds=runtime,
+            catalogue_pages_discovered=len(catalogue_pages),
+            books_discovered=books_discovered,
+            books_successfully_processed=valid_books,
+            validation_errors=validation_errors,
+            failed_pages=self.stats['failed_pages'],
+            cache_hits=self.stats['cache_hits'],
+            network_requests=self.stats['network_requests'],
+            retry_attempts=self.stats['retry_attempts'],
+            error_summary=self.stats['error_summary'],
+            sample_book_url=sample_url
+        )
+        
+        # Save report
+        report_file = self.output_dir / "run-report.json"
+        with open(report_file, 'w', encoding='utf-8') as f:
+            json.dump(report.model_dump(mode='json'), f, indent=2, ensure_ascii=False)
+        
+        print(f"Run report saved to {report_file}")
+        return report
 
 def stage1():
     """Stage 1: Fetch and cache catalogue page 1."""
@@ -406,6 +523,35 @@ def stage4():
     
     return valid_books, validation_errors
 
+def stage5():
+    """Stage 5: Survive failures, report the run."""
+    scraper = PoliteScraper()
+    
+    # Scrape all book details WITH a deliberate fake URL for error testing
+    raw_books_data = scraper.scrape_all_books(max_catalogue_pages=3, include_fake_url=True)
+    
+    # Validate and save
+    valid_books, validation_errors = scraper.validate_and_save_books(raw_books_data)
+    
+    # Generate comprehensive run report
+    catalogue_pages, _ = scraper.discover_catalogue_pages(max_pages=3)
+    report = scraper.generate_run_report(
+        catalogue_pages=catalogue_pages,
+        books_discovered=len(raw_books_data) + 1,  # +1 for fake URL
+        valid_books=len(valid_books),
+        validation_errors=len(validation_errors)
+    )
+    
+    print(f"\nStage 5 Complete:")
+    print(f"Valid books processed: {len(valid_books)}")
+    print(f"Failed pages: {scraper.stats['failed_pages']} (should be ≥1 due to fake URL)")
+    print(f"Cache hits: {scraper.stats['cache_hits']}")
+    print(f"Network requests: {scraper.stats['network_requests']}")
+    print(f"Retry attempts: {scraper.stats['retry_attempts']}")
+    print(f"Runtime: {report.total_runtime_seconds:.2f} seconds")
+    
+    return valid_books, validation_errors, report
+
 def main():
     """Main entry point - runs the appropriate stage."""
     import sys
@@ -418,9 +564,11 @@ def main():
         stage3()
     elif len(sys.argv) > 1 and sys.argv[1] == "stage4":
         stage4()
+    elif len(sys.argv) > 1 and sys.argv[1] == "stage5":
+        stage5()
     else:
-        # Default: run stage 4 for now
-        stage4()
+        # Default: run stage 5 for now
+        stage5()
 
 if __name__ == "__main__":
     main()
