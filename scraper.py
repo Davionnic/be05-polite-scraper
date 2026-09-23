@@ -11,7 +11,7 @@ import requests
 from urllib.parse import urljoin, urlparse
 from pathlib import Path
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List, Set
 from bs4 import BeautifulSoup
 
 # Configuration
@@ -88,8 +88,77 @@ class PoliteScraper:
         except requests.RequestException as e:
             print(f"ERROR fetching {url}: {e}")
             raise
+    
+    def extract_book_urls(self, html: str, source_page_url: str) -> List[str]:
+        """Extract all book detail page URLs from a catalogue page."""
+        soup = BeautifulSoup(html, 'html.parser')
+        book_urls = []
+        
+        # Find all book product containers
+        for article in soup.find_all('article', class_='product_pod'):
+            # Look for the link to the book detail page
+            link = article.find('h3').find('a') if article.find('h3') else None
+            if link and link.get('href'):
+                # Convert relative URL to absolute
+                book_url = urljoin(source_page_url, link['href'])
+                book_urls.append(book_url)
+        
+        return book_urls
+    
+    def find_next_page_url(self, html: str, current_page_url: str) -> Optional[str]:
+        """Find the URL of the next catalogue page."""
+        soup = BeautifulSoup(html, 'html.parser')
+        
+        # Look for next page link
+        next_link = soup.find('li', class_='next')
+        if next_link:
+            link = next_link.find('a')
+            if link and link.get('href'):
+                return urljoin(current_page_url, link['href'])
+        
+        return None
+    
+    def discover_catalogue_pages(self, max_pages: int = 3) -> tuple[List[str], List[str]]:
+        """
+        Discover catalogue pages and extract all book URLs.
+        Returns: (catalogue_page_urls, all_book_urls)
+        """
+        catalogue_pages = []
+        all_book_urls = []
+        unique_book_urls = set()
+        
+        # Start with the first page
+        current_url = BASE_URL
+        
+        for page_num in range(1, max_pages + 1):
+            print(f"\nProcessing catalogue page {page_num}: {current_url}")
+            
+            # Fetch the catalogue page
+            html, was_cached = self.fetch_page(current_url)
+            catalogue_pages.append(current_url)
+            
+            # Extract book URLs from this page
+            book_urls = self.extract_book_urls(html, current_url)
+            print(f"Found {len(book_urls)} books on page {page_num}")
+            
+            # Add to our collections (dedupe with set)
+            for url in book_urls:
+                if url not in unique_book_urls:
+                    unique_book_urls.add(url)
+                    all_book_urls.append(url)
+            
+            # Find next page (unless we're on the last requested page)
+            if page_num < max_pages:
+                next_url = self.find_next_page_url(html, current_url)
+                if next_url:
+                    current_url = next_url
+                else:
+                    print(f"No next page found after page {page_num}")
+                    break
+        
+        return catalogue_pages, all_book_urls
 
-def main():
+def stage1():
     """Stage 1: Fetch and cache catalogue page 1."""
     scraper = PoliteScraper()
     
@@ -105,6 +174,33 @@ def main():
     print(f"- Cached catalogue page 1: {len(html):,} bytes")
     print(f"- Cache status: {'HIT' if was_cached else 'MISS'}")
     print(f"- File saved: {cache_file}")
+
+def stage2():
+    """Stage 2: Discover three catalogue pages."""
+    scraper = PoliteScraper()
+    
+    # Discover catalogue pages and extract book URLs
+    catalogue_pages, book_urls = scraper.discover_catalogue_pages(max_pages=3)
+    
+    print(f"\nStage 2 Complete:")
+    print(f"catalogue_pages={len(catalogue_pages)} discovered={len(book_urls)} unique_urls={len(book_urls)}")
+    print(f"\nCatalogue pages discovered:")
+    for i, url in enumerate(catalogue_pages, 1):
+        print(f"  {i}. {url}")
+    
+    return catalogue_pages, book_urls
+
+def main():
+    """Main entry point - runs the appropriate stage."""
+    import sys
+    
+    if len(sys.argv) > 1 and sys.argv[1] == "stage1":
+        stage1()
+    elif len(sys.argv) > 1 and sys.argv[1] == "stage2":
+        stage2()
+    else:
+        # Default: run stage 2 for now
+        stage2()
 
 if __name__ == "__main__":
     main()
