@@ -11,8 +11,9 @@ import requests
 from urllib.parse import urljoin, urlparse
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, List, Set
+from typing import Optional, List, Set, Dict, Any
 from bs4 import BeautifulSoup
+import json
 
 # Configuration
 USER_AGENT = "FlyRankBE05Bot/1.0 (Davionnic; educational)"
@@ -157,6 +158,91 @@ class PoliteScraper:
                     break
         
         return catalogue_pages, all_book_urls
+    
+    def extract_book_details(self, book_url: str, source_page: str) -> Dict[str, Any]:
+        """Extract detailed information from a book page."""
+        html, was_cached = self.fetch_page(book_url)
+        soup = BeautifulSoup(html, 'html.parser')
+        
+        # Extract title (from h1 in product_main)
+        title_elem = soup.find('div', class_='product_main').find('h1') if soup.find('div', class_='product_main') else None
+        title = title_elem.get_text(strip=True) if title_elem else "Unknown Title"
+        
+        # Extract price (from price_color class)
+        price_elem = soup.find('p', class_='price_color')
+        price_text = price_elem.get_text(strip=True) if price_elem else "£0.00"
+        
+        # Extract availability (from instock availability class)
+        availability_elem = soup.find('p', class_='instock availability')
+        availability_text = availability_elem.get_text(strip=True) if availability_elem else "Unknown"
+        
+        # Extract rating (from star-rating class)
+        rating_elem = soup.find('p', class_='star-rating')
+        rating_text = None
+        if rating_elem:
+            # Rating is in the class name like "star-rating Three"
+            classes = rating_elem.get('class', [])
+            for cls in classes:
+                if cls in ['One', 'Two', 'Three', 'Four', 'Five']:
+                    rating_text = cls
+                    break
+        
+        # Extract description (paragraph after product_description div)
+        description = None
+        desc_header = soup.find('div', id='product_description')
+        if desc_header:
+            desc_p = desc_header.find_next_sibling('p')
+            if desc_p:
+                description = desc_p.get_text(strip=True)
+        
+        # Current timestamp
+        fetched_at = datetime.now().isoformat()
+        
+        return {
+            'title': title,
+            'product_url': book_url,
+            'price_text': price_text,
+            'availability_text': availability_text,
+            'rating_text': rating_text,
+            'description': description,
+            'source_page': source_page,
+            'fetched_at': fetched_at
+        }
+    
+    def scrape_all_books(self, max_catalogue_pages: int = 3) -> List[Dict[str, Any]]:
+        """Scrape details for all books from the specified number of catalogue pages."""
+        # First, discover all catalogue pages and book URLs
+        catalogue_pages, book_urls = self.discover_catalogue_pages(max_pages=max_catalogue_pages)
+        
+        print(f"\nStarting book detail extraction for {len(book_urls)} books...")
+        
+        books_data = []
+        
+        for i, book_url in enumerate(book_urls, 1):
+            print(f"Fetching book {i}/{len(book_urls)}: {book_url}")
+            
+            # Determine which catalogue page this book came from
+            source_page = "Unknown"
+            for j, cat_page in enumerate(catalogue_pages):
+                if i <= (j + 1) * 20:  # Assuming 20 books per page
+                    source_page = cat_page
+                    break
+            
+            try:
+                book_data = self.extract_book_details(book_url, source_page)
+                books_data.append(book_data)
+                
+                # Print first record as required
+                if i == 1:
+                    print(f"\nFirst raw record:")
+                    print(json.dumps(book_data, indent=2))
+                
+            except Exception as e:
+                print(f"ERROR processing book {book_url}: {e}")
+                continue
+        
+        print(f"\nDetail pages fetched: detail_pages={len(books_data)}")
+        return books_data
 
 def stage1():
     """Stage 1: Fetch and cache catalogue page 1."""
@@ -190,6 +276,18 @@ def stage2():
     
     return catalogue_pages, book_urls
 
+def stage3():
+    """Stage 3: Extract book details."""
+    scraper = PoliteScraper()
+    
+    # Scrape all book details
+    books_data = scraper.scrape_all_books(max_catalogue_pages=3)
+    
+    print(f"\nStage 3 Complete:")
+    print(f"Extracted details for {len(books_data)} books")
+    
+    return books_data
+
 def main():
     """Main entry point - runs the appropriate stage."""
     import sys
@@ -198,9 +296,11 @@ def main():
         stage1()
     elif len(sys.argv) > 1 and sys.argv[1] == "stage2":
         stage2()
+    elif len(sys.argv) > 1 and sys.argv[1] == "stage3":
+        stage3()
     else:
-        # Default: run stage 2 for now
-        stage2()
+        # Default: run stage 3 for now
+        stage3()
 
 if __name__ == "__main__":
     main()
