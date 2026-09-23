@@ -14,12 +14,55 @@ from datetime import datetime
 from typing import Optional, List, Set, Dict, Any
 from bs4 import BeautifulSoup
 import json
+import re
+from pydantic import BaseModel, field_validator, HttpUrl
+from decimal import Decimal
 
 # Configuration
 USER_AGENT = "FlyRankBE05Bot/1.0 (Davionnic; educational)"
 REQUEST_TIMEOUT = 10
 MIN_DELAY = 0.5  # 500ms minimum delay between requests
 BASE_URL = "https://books.toscrape.com/"
+
+class BookRecord(BaseModel):
+    """Pydantic schema for normalized book records."""
+    title: str
+    product_url: HttpUrl
+    price_gbp: float
+    availability_text: str
+    rating_text: Optional[str] = None
+    description: Optional[str] = None
+    source_page: str
+    fetched_at: str
+    
+    @field_validator('price_gbp', mode='before')
+    @classmethod
+    def parse_price(cls, v):
+        """Extract and convert price to float GBP."""
+        if isinstance(v, str):
+            # Remove currency symbols and extract numeric value
+            price_match = re.search(r'[\d.]+', v.replace('£', '').replace(',', ''))
+            if price_match:
+                return float(price_match.group())
+        return float(v) if v is not None else 0.0
+    
+    @field_validator('product_url', mode='before') 
+    @classmethod
+    def validate_url(cls, v):
+        """Ensure URL is absolute."""
+        if isinstance(v, str):
+            if not v.startswith('http'):
+                # Convert relative to absolute
+                from urllib.parse import urljoin
+                return urljoin(BASE_URL, v)
+            return v
+        return str(v)
+
+class ValidationError(BaseModel):
+    """Schema for validation error records."""
+    raw_data: Dict[str, Any]
+    error_message: str
+    field_errors: Dict[str, str] = {}
 
 class PoliteScraper:
     """A polite web scraper with caching and rate limiting."""
@@ -243,6 +286,61 @@ class PoliteScraper:
         
         print(f"\nDetail pages fetched: detail_pages={len(books_data)}")
         return books_data
+    
+    def validate_and_save_books(self, raw_books_data: List[Dict[str, Any]]) -> tuple[List[BookRecord], List[ValidationError]]:
+        """Validate raw book data and save to JSON files."""
+        valid_books = []
+        validation_errors = []
+        
+        print(f"\nValidating {len(raw_books_data)} book records...")
+        
+        for i, raw_book in enumerate(raw_books_data, 1):
+            try:
+                # Convert raw price_text to price_gbp for validation
+                book_data = raw_book.copy()
+                book_data['price_gbp'] = book_data.pop('price_text')
+                
+                # Validate with Pydantic
+                validated_book = BookRecord(**book_data)
+                valid_books.append(validated_book)
+                
+            except Exception as e:
+                # Collect validation errors
+                error_record = ValidationError(
+                    raw_data=raw_book,
+                    error_message=str(e),
+                    field_errors={}
+                )
+                
+                # Extract field-specific errors if available
+                if hasattr(e, 'errors'):
+                    for err in e.errors():
+                        field = '.'.join(str(loc) for loc in err['loc'])
+                        error_record.field_errors[field] = err['msg']
+                
+                validation_errors.append(error_record)
+                print(f"Validation error for book {i}: {e}")
+        
+        # Save valid books
+        books_file = self.output_dir / "books.json"
+        valid_books_data = [book.model_dump(mode='json') for book in valid_books]
+        
+        with open(books_file, 'w', encoding='utf-8') as f:
+            json.dump(valid_books_data, f, indent=2, ensure_ascii=False)
+        
+        print(f"Saved {len(valid_books)} valid books to {books_file}")
+        
+        # Save validation errors if any
+        if validation_errors:
+            errors_file = self.output_dir / "errors.json" 
+            errors_data = [error.model_dump(mode='json') for error in validation_errors]
+            
+            with open(errors_file, 'w', encoding='utf-8') as f:
+                json.dump(errors_data, f, indent=2, ensure_ascii=False)
+            
+            print(f"Saved {len(validation_errors)} validation errors to {errors_file}")
+        
+        return valid_books, validation_errors
 
 def stage1():
     """Stage 1: Fetch and cache catalogue page 1."""
@@ -288,6 +386,26 @@ def stage3():
     
     return books_data
 
+def stage4():
+    """Stage 4: Validate normalized records."""
+    scraper = PoliteScraper()
+    
+    # Scrape all book details
+    raw_books_data = scraper.scrape_all_books(max_catalogue_pages=3)
+    
+    # Validate and save
+    valid_books, validation_errors = scraper.validate_and_save_books(raw_books_data)
+    
+    print(f"\nStage 4 Complete:")
+    print(f"Valid books: {len(valid_books)}")
+    print(f"Validation errors: {len(validation_errors)}")
+    print(f"Total processed: {len(raw_books_data)}")
+    
+    # Verify rerun stays at 60
+    print(f"Rerun verification: {len(raw_books_data)} books processed (should stay 60)")
+    
+    return valid_books, validation_errors
+
 def main():
     """Main entry point - runs the appropriate stage."""
     import sys
@@ -298,9 +416,11 @@ def main():
         stage2()
     elif len(sys.argv) > 1 and sys.argv[1] == "stage3":
         stage3()
+    elif len(sys.argv) > 1 and sys.argv[1] == "stage4":
+        stage4()
     else:
-        # Default: run stage 3 for now
-        stage3()
+        # Default: run stage 4 for now
+        stage4()
 
 if __name__ == "__main__":
     main()
